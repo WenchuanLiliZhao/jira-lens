@@ -29,6 +29,7 @@
         "aria-valid-attr-value": "off"
       }
     ],
-    "typescript-config/is-valid": "off"
+    "typescript-config/is-valid": "off",
+    "typescript-config/consistent-casing": "off"
   }
 }
