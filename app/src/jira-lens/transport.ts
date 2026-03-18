@@ -7,10 +7,6 @@
  *   VS Code Webview  →  vscode.postMessage  →  extension.ts  →  Jira Cloud
  *   Browser (dev)    →  fetch()             →  server.js proxy  →  Jira Cloud
  *
- * Usage (identical in both environments):
- *   import { getProjects, getIssues, getIssue } from './transport';
- *   const projects = await getProjects();
- *
  * PUSH MESSAGES
  * ─────────────
  * The extension can send unsolicited messages (no id) to the Webview.
@@ -20,8 +16,7 @@
  * INITIAL STEP
  * ────────────
  * The extension injects window.__INITIAL_STEP__ = N before the Webview loads.
- * Import `initialStep` to read it. Defaults to 2 in browser dev mode (skips
- * onboarding so `npm run dev` continues to work as before).
+ * Import `initialStep` to read it. Defaults to 2 in browser dev mode.
  *
  * STEPS:  0 = credentials form · 1 = connecting · 2 = main interface
  */
@@ -38,7 +33,7 @@ const isVSCode: boolean =
 
 export const initialStep: number = isVSCode
   ? (((window as unknown as Record<string, unknown>).__INITIAL_STEP__ as number) ?? 0)
-  : 2; // browser dev mode: skip onboarding
+  : 2;
 
 // ── VS Code postMessage channel ───────────────────────────────────────────────
 
@@ -71,10 +66,6 @@ export type PushMessage = ConnectProgressMessage;
 type PushHandler = (msg: PushMessage) => void;
 const pushHandlers: PushHandler[] = [];
 
-/**
- * Subscribe to push messages from the extension host.
- * Returns an unsubscribe function — call it in useEffect cleanup.
- */
 export function onPush(handler: PushHandler): () => void {
   pushHandlers.push(handler);
   return () => {
@@ -91,7 +82,6 @@ if (isVSCode) {
   ) => {
     const data = event.data;
 
-    // Push message: no id, has type
     if (!data.id && data.type) {
       const push = data as unknown as PushMessage;
       for (const handler of pushHandlers) {
@@ -100,7 +90,6 @@ if (isVSCode) {
       return;
     }
 
-    // Request-response: match by id
     if (data.id) {
       const p = pending.get(data.id);
       if (!p) return;
@@ -150,49 +139,17 @@ async function browserPost<T>(path: string, body: unknown): Promise<T> {
 
 // ── Onboarding actions (VS Code only) ─────────────────────────────────────────
 
-/** Save credentials via SecretStorage. Extension will then push CONNECT_PROGRESS. */
 export async function saveCredentials(domain: string, email: string, token: string): Promise<void> {
   if (!isVSCode) return;
   await callExtension('SAVE_CREDENTIALS', { domain, email, token });
 }
 
-/**
- * Delete the stored API token from SecretStorage.
- * Used by the "Reset connection" nav action so the user can re-enter credentials.
- * Domain and email are left in VS Code settings to pre-fill the form.
- */
 export async function resetCredentials(): Promise<void> {
   if (!isVSCode) return;
   await callExtension('RESET_CREDENTIALS');
 }
 
-// ── Optional jira-mcp banner (VS Code only) ──────────────────────────────────
-
-/** Returns whether jira-mcp is installed (~/Jira-MCP/package.json exists). */
-export async function getMcpInstallState(): Promise<{ installed: boolean }> {
-  if (!isVSCode) return { installed: false };
-  return callExtension('GET_MCP_INSTALL_STATE') as Promise<{ installed: boolean }>;
-}
-
-/** Check whether the "Install jira-mcp" banner should be shown. */
-export async function getMcpBannerState(): Promise<{ show: boolean }> {
-  if (!isVSCode) return { show: false };
-  return callExtension('GET_MCP_BANNER_STATE') as Promise<{ show: boolean }>;
-}
-
-/** Fire-and-forget: ask extension to open Cursor Chat with MCP install prompt. */
-export function installMcpOptional(): void {
-  if (!isVSCode) return;
-  vscodeApi!.postMessage({ id: String(++_messageId), type: 'INSTALL_MCP_OPTIONAL' });
-}
-
-/** Dismiss the jira-mcp banner permanently. */
-export async function dismissMcpBanner(): Promise<void> {
-  if (!isVSCode) return;
-  await callExtension('DISMISS_MCP_BANNER');
-}
-
-// ── Public Jira API ───────────────────────────────────────────────────────────
+// ── Public Jira API — Read ────────────────────────────────────────────────────
 
 export interface JiraProject {
   key: string;
@@ -235,7 +192,7 @@ export interface JiraIssueDetail {
     status: { name: string };
     priority?: { name: string; iconUrl?: string };
     issuetype: { name: string; iconUrl?: string };
-    assignee?: { displayName: string } | null;
+    assignee?: { displayName: string; accountId?: string } | null;
     reporter?: { displayName: string };
     created?: string;
     updated?: string;
@@ -267,4 +224,65 @@ export async function getIssue(key: string): Promise<JiraIssueDetail> {
     return callExtension('GET_ISSUE', { key }) as Promise<JiraIssueDetail>;
   }
   return browserFetch<JiraIssueDetail>(`/api/issue/${key}`);
+}
+
+// ── Public Jira API — Write ───────────────────────────────────────────────────
+
+export interface JiraTransition {
+  id: string;
+  name: string;
+  to: string;
+}
+
+export async function getTransitions(key: string): Promise<JiraTransition[]> {
+  if (!isVSCode) return [];
+  return callExtension('GET_TRANSITIONS', { key }) as Promise<JiraTransition[]>;
+}
+
+export async function transitionIssue(key: string, transitionId: string, comment?: string): Promise<{ ok: true; key: string }> {
+  return callExtension('TRANSITION_ISSUE', { key, transitionId, ...(comment ? { comment } : {}) }) as Promise<{ ok: true; key: string }>;
+}
+
+export interface JiraUser {
+  accountId: string;
+  displayName: string;
+  email: string | null;
+  active: boolean;
+}
+
+export async function searchUsers(query: string, maxResults?: number): Promise<JiraUser[]> {
+  if (!isVSCode) return [];
+  return callExtension('SEARCH_USERS', { query, ...(maxResults ? { maxResults } : {}) }) as Promise<JiraUser[]>;
+}
+
+export async function assignIssue(key: string, accountId: string | null): Promise<{ ok: true; key: string }> {
+  return callExtension('ASSIGN_ISSUE', { key, accountId }) as Promise<{ ok: true; key: string }>;
+}
+
+export async function addComment(key: string, body: string): Promise<{ ok: true; key: string }> {
+  return callExtension('ADD_COMMENT', { key, body }) as Promise<{ ok: true; key: string }>;
+}
+
+export async function updateIssue(key: string, updates: Record<string, unknown>): Promise<{ ok: true; key: string; url: string }> {
+  return callExtension('UPDATE_ISSUE', { key, updates }) as Promise<{ ok: true; key: string; url: string }>;
+}
+
+export async function createIssue(opts: Record<string, unknown>): Promise<{ key: string; id: string; url: string }> {
+  return callExtension('CREATE_ISSUE', { opts }) as Promise<{ key: string; id: string; url: string }>;
+}
+
+export interface JiraLinkType {
+  id: string;
+  name: string;
+  inward: string;
+  outward: string;
+}
+
+export async function fetchLinkTypes(): Promise<JiraLinkType[]> {
+  if (!isVSCode) return [];
+  return callExtension('FETCH_LINK_TYPES') as Promise<JiraLinkType[]>;
+}
+
+export async function linkIssues(sourceKey: string, targetKey: string, linkTypeName?: string): Promise<unknown> {
+  return callExtension('LINK_ISSUES', { sourceKey, targetKey, ...(linkTypeName ? { linkTypeName } : {}) });
 }

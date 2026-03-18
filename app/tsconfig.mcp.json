@@ -1,9 +1,9 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "commonjs",
+    "module": "ES2022",
     "moduleResolution": "node",
-    "outDir": "out",
+    "outDir": "out/mcp",
     "rootDir": "src",
     "strict": true,
     "skipLibCheck": true,
@@ -11,6 +11,6 @@
     "esModuleInterop": true,
     "types": ["node"]
   },
-  "include": ["src/extension.ts", "src/lib/**/*.ts"],
-  "exclude": ["node_modules", "dist", "out"]
+  "include": ["src/mcp/server.ts", "src/cli/**/*.ts", "src/lib/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }

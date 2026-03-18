@@ -11,7 +11,7 @@
  *     ↕ vscode.postMessage / onDidReceiveMessage
  *   Webview (dist/index.html — Vite-built React app)
  *     ↕ transport.ts abstraction
- *   Jira Cloud REST API
+ *   Jira Cloud REST API (via lib/jira-client.ts)
  *
  * MESSAGE PROTOCOL
  * ────────────────
@@ -22,19 +22,10 @@
  * Push (Host → Webview, no id):
  *   { type: 'CONNECT_PROGRESS', stage: 'validating'|'fetching'|'done'|'error', message?: string }
  *
- * ONBOARDING STEPS
- * ────────────────
- *   0 — Credentials needed (SecretStorage token missing)
- *   1 — Connecting         (credentials present, attempting connection)
- *   2 — Main interface     (connected)
- *
  * CREDENTIALS
  * ───────────
  *   JIRA_DOMAIN, JIRA_EMAIL → VS Code settings (jira-lens.domain / jira-lens.email)
  *   JIRA_TOKEN              → VS Code SecretStorage ('jira-lens.token')
- *
- * When credentials are saved, they are also written to ~/Jira-MCP/config/secrets.json
- * so the standalone jira-mcp server (used for Cursor AI Chat) stays in sync.
  *
  * BUILD
  * ─────
@@ -44,28 +35,47 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
+
+import { getIdeAdapter } from './ide-adapters';
+
+import {
+  type Credentials,
+  fetchProjects,
+  fetchIssuesForProject,
+  fetchIssueRaw,
+  getTransitions as jiraGetTransitions,
+  transitionIssue as jiraTransitionIssue,
+  assignIssue as jiraAssignIssue,
+  searchUsers as jiraSearchUsers,
+  addComment as jiraAddComment,
+  updateIssue as jiraUpdateIssue,
+  createIssue as jiraCreateIssue,
+  fetchLinkTypes as jiraFetchLinkTypes,
+  linkIssues as jiraLinkIssues,
+} from './lib/jira-client';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-interface Credentials {
-  domain: string;
-  email: string;
-  token: string;
-}
 
 type Step = 0 | 1 | 2;
 
 type InboundMessage =
+  // Read operations
   | { id: string; type: 'GET_PROJECTS' }
   | { id: string; type: 'GET_ISSUES'; project: string; jql?: string }
   | { id: string; type: 'GET_ISSUE'; key: string }
+  // Onboarding
   | { id: string; type: 'SAVE_CREDENTIALS'; domain: string; email: string; token: string }
   | { id: string; type: 'RESET_CREDENTIALS' }
-  | { id: string; type: 'INSTALL_MCP_OPTIONAL' }
-  | { id: string; type: 'DISMISS_MCP_BANNER' }
-  | { id: string; type: 'GET_MCP_BANNER_STATE' }
-  | { id: string; type: 'GET_MCP_INSTALL_STATE' };
+  // Write operations (Phase 2)
+  | { id: string; type: 'GET_TRANSITIONS'; key: string }
+  | { id: string; type: 'TRANSITION_ISSUE'; key: string; transitionId: string; comment?: string }
+  | { id: string; type: 'ASSIGN_ISSUE'; key: string; accountId: string | null }
+  | { id: string; type: 'SEARCH_USERS'; query: string; maxResults?: number }
+  | { id: string; type: 'ADD_COMMENT'; key: string; body: string }
+  | { id: string; type: 'UPDATE_ISSUE'; key: string; updates: Record<string, unknown> }
+  | { id: string; type: 'CREATE_ISSUE'; opts: Record<string, unknown> }
+  | { id: string; type: 'FETCH_LINK_TYPES' }
+  | { id: string; type: 'LINK_ISSUES'; sourceKey: string; targetKey: string; linkTypeName?: string };
 
 type PushMessage =
   | { type: 'CONNECT_PROGRESS'; stage: 'validating' | 'fetching' | 'done' | 'error'; message?: string };
@@ -91,138 +101,47 @@ async function saveCredentials(
   const config = vscode.workspace.getConfiguration('jira-lens');
   await config.update('domain', domain, vscode.ConfigurationTarget.Global);
   await config.update('email', email, vscode.ConfigurationTarget.Global);
-
-  syncCredentialsToMcp(domain, email, token);
 }
 
-/**
- * Write credentials to ~/Jira-MCP/config/secrets.json so the standalone
- * jira-mcp server (Cursor AI Chat integration) stays in sync.
- * Best-effort — fails silently if Jira-MCP is not installed.
- */
-function syncCredentialsToMcp(domain: string, email: string, token: string): void {
-  try {
-    const mcpConfigDir = path.join(os.homedir(), 'Jira-MCP', 'config');
-    if (!fs.existsSync(mcpConfigDir)) return;
-    const secretsPath = path.join(mcpConfigDir, 'secrets.json');
-    const payload = { JIRA_DOMAIN: domain, JIRA_EMAIL: email, JIRA_TOKEN: token };
-    fs.writeFileSync(secretsPath, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
-  } catch {
-    // jira-mcp not installed or dir not writable — that's fine
-  }
+// ── MCP server registration ──────────────────────────────────────────────────
+
+const MCP_CRED_FILENAME = 'mcp-credentials.json';
+
+function getCredFilePath(context: vscode.ExtensionContext): string {
+  return path.join(context.globalStorageUri.fsPath, MCP_CRED_FILENAME);
 }
 
-function isMcpInstalled(): boolean {
-  const mcpDir = path.join(os.homedir(), 'Jira-MCP');
-  return fs.existsSync(path.join(mcpDir, 'package.json'));
+function getMcpServerJsPath(context: vscode.ExtensionContext): string {
+  return path.join(context.extensionPath, 'out', 'mcp', 'mcp', 'server.js');
+}
+
+function writeCredentialFile(credPath: string, creds: Credentials): void {
+  fs.mkdirSync(path.dirname(credPath), { recursive: true });
+  fs.writeFileSync(
+    credPath,
+    JSON.stringify({ domain: creds.domain, email: creds.email, token: creds.token }),
+  );
+  fs.chmodSync(credPath, 0o600);
+}
+
+async function registerMcpServer(context: vscode.ExtensionContext, creds: Credentials): Promise<void> {
+  const credPath = getCredFilePath(context);
+  writeCredentialFile(credPath, creds);
+  await getIdeAdapter().registerMcp(credPath, getMcpServerJsPath(context));
+}
+
+async function unregisterMcpServer(context: vscode.ExtensionContext): Promise<void> {
+  const credPath = getCredFilePath(context);
+  if (fs.existsSync(credPath)) fs.unlinkSync(credPath);
+  await getIdeAdapter().unregisterMcp();
 }
 
 // ── Step detection ────────────────────────────────────────────────────────────
 
 async function detectInitialStep(context: vscode.ExtensionContext): Promise<Step> {
   const creds = await loadCredentials(context);
-  if (!creds) return 0;   // no credentials → show credential form
-  return 1;               // has credentials → run connection flow
-}
-
-// ── Jira API client ───────────────────────────────────────────────────────────
-
-async function jiraFetch(creds: Credentials, apiPath: string, opts: RequestInit = {}): Promise<unknown> {
-  const auth = Buffer.from(`${creds.email}:${creds.token}`).toString('base64');
-  const res = await fetch(`https://${creds.domain}${apiPath}`, {
-    ...opts,
-    headers: {
-      Accept: 'application/json',
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json',
-      ...(opts.headers as Record<string, string> ?? {}),
-    },
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    const parsed = text ? (JSON.parse(text) as { errorMessages?: string[] }) : null;
-    throw new Error(parsed?.errorMessages?.[0] ?? text ?? `HTTP ${res.status}`);
-  }
-  return text ? JSON.parse(text) : null;
-}
-
-// ── Message handlers ──────────────────────────────────────────────────────────
-
-async function handleGetProjects(creds: Credentials): Promise<{ key: string; name: string }[]> {
-  let raw = await jiraFetch(creds, '/rest/api/3/project') as { key: string; name: string }[];
-  if (!Array.isArray(raw) || raw.length === 0) {
-    const search = await jiraFetch(creds, '/rest/api/3/project/search?maxResults=100') as { values?: { key: string; name: string }[] };
-    raw = search.values ?? [];
-  }
-  return raw.map(p => ({ key: p.key, name: p.name }));
-}
-
-async function handleGetIssues(creds: Credentials, project: string, jql?: string): Promise<{ issues: unknown[] }> {
-  const baseJql = jql ? `project = ${project} AND ${jql}` : `project = ${project}`;
-  const fields = ['summary', 'status', 'assignee', 'issuetype', 'priority', 'created', 'updated', 'labels', 'fixVersions'];
-  const body = { jql: baseJql, fields, maxResults: 100 };
-
-  let data: { issues?: unknown[] };
-  try {
-    data = await jiraFetch(creds, '/rest/api/3/search/jql', { method: 'POST', body: JSON.stringify(body) }) as { issues?: unknown[] };
-  } catch (e) {
-    const msg = ((e as Error).message ?? '').toLowerCase();
-    if (msg.includes('removed') || msg.includes('deprecated') || msg.includes('404')) {
-      data = await jiraFetch(creds, '/rest/api/3/search', { method: 'POST', body: JSON.stringify({ ...body, startAt: 0 }) }) as { issues?: unknown[] };
-    } else {
-      throw e;
-    }
-  }
-  return { issues: data?.issues ?? [] };
-}
-
-async function handleGetIssue(creds: Credentials, key: string): Promise<unknown> {
-  const fields = [
-    'summary', 'description', 'status', 'priority', 'issuetype',
-    'assignee', 'reporter', 'created', 'updated', 'duedate',
-    'labels', 'fixVersions', 'subtasks', 'issuelinks', 'attachment',
-    'comment', 'customfield_10016', 'customfield_10020', 'parent',
-  ].join(',');
-  const data = await jiraFetch(creds, `/rest/api/3/issue/${key}?fields=${fields}`) as {
-    fields?: Record<string, unknown>;
-    [key: string]: unknown;
-  };
-  const f = data?.fields ?? {};
-  return {
-    ...data,
-    fields: {
-      ...f,
-      story_points: f['customfield_10016'] ?? null,
-      sprint: f['customfield_10020'] ?? null,
-      epic: f['parent'] ? { key: (f['parent'] as { key: string }).key, fields: (f['parent'] as { fields?: unknown }).fields } : null,
-    },
-  };
-}
-
-// ── MCP install / update prompts (optional — for Cursor AI Chat integration) ─
-//
-// Both prompts reference the GitHub README so the AI reads the authoritative
-// instructions rather than relying on hardcoded steps that may go stale.
-// The current workspace folder is injected at runtime so link-to-project.sh
-// targets the correct directory.
-
-function buildMcpInstallPrompt(workspaceFolder: string): string {
-  return (
-    'Please install the Jira MCP server for me by following the instructions at ' +
-    'https://github.com/WenchuanLiliZhao/jira-mcp. ' +
-    `Link the commands into my current project at: ${workspaceFolder}. ` +
-    'My Jira credentials are already configured — Jira Lens wrote them to ' +
-    '~/Jira-MCP/config/secrets.json automatically, so you can skip that step.'
-  );
-}
-
-function buildMcpUpdatePrompt(workspaceFolder: string): string {
-  return (
-    'Please update my Jira MCP server (already installed at ~/Jira-MCP) by following ' +
-    'the instructions at https://github.com/WenchuanLiliZhao/jira-mcp. ' +
-    `Re-link the commands into my current project at: ${workspaceFolder}. ` +
-    'My Jira credentials are already in ~/Jira-MCP/config/secrets.json — do not overwrite them.'
-  );
+  if (!creds) return 0;
+  return 1;
 }
 
 // ── WebviewPanel ──────────────────────────────────────────────────────────────
@@ -285,11 +204,9 @@ class JiraLensPanel {
 
     let html = fs.readFileSync(indexPath.fsPath, 'utf-8');
 
-    // Rewrite relative asset paths to vscode-resource:// URIs
     const distUri = this.panel.webview.asWebviewUri(distPath).toString();
     html = html.replace(/(src|href)="\.\//g, `$1="${distUri}/`);
 
-    // Inject flags and CSP
     const cspSource = this.panel.webview.cspSource;
     const cspMeta = [
       `<meta http-equiv="Content-Security-Policy" content="`,
@@ -337,9 +254,10 @@ class JiraLensPanel {
         return;
       }
 
-      // Validate by fetching projects (lightweight check)
       this.sendPush({ type: 'CONNECT_PROGRESS', stage: 'fetching' });
-      await handleGetProjects(creds);
+      await fetchProjects(creds);
+
+      await registerMcpServer(this.context, creds);
 
       this.sendPush({ type: 'CONNECT_PROGRESS', stage: 'done' });
     } catch (err) {
@@ -359,27 +277,24 @@ class JiraLensPanel {
 
       switch (msg.type) {
 
-        // ── Jira API ───────────────────────────────────────────────────────
+        // ── Read operations ─────────────────────────────────────────────────
         case 'GET_PROJECTS': {
-          const creds = await loadCredentials(this.context);
-          if (!creds) throw new Error('Not connected. Please complete setup first.');
-          result = await handleGetProjects(creds);
+          const creds = await this.requireCreds();
+          result = await fetchProjects(creds);
           break;
         }
         case 'GET_ISSUES': {
-          const creds = await loadCredentials(this.context);
-          if (!creds) throw new Error('Not connected. Please complete setup first.');
-          result = await handleGetIssues(creds, msg.project, msg.jql);
+          const creds = await this.requireCreds();
+          result = await fetchIssuesForProject(creds, msg.project, msg.jql);
           break;
         }
         case 'GET_ISSUE': {
-          const creds = await loadCredentials(this.context);
-          if (!creds) throw new Error('Not connected. Please complete setup first.');
-          result = await handleGetIssue(creds, msg.key);
+          const creds = await this.requireCreds();
+          result = await fetchIssueRaw(creds, msg.key);
           break;
         }
 
-        // ── Onboarding ─────────────────────────────────────────────────────
+        // ── Onboarding ───────────────────────────────────────────────────────
         case 'SAVE_CREDENTIALS': {
           await saveCredentials(this.context, msg.domain, msg.email, msg.token);
           result = { ok: true };
@@ -388,37 +303,58 @@ class JiraLensPanel {
           return;
         }
         case 'RESET_CREDENTIALS': {
-          // Wipe the stored token so detectInitialStep() returns 0 on next open.
-          // Domain and email are left in settings (non-sensitive) to pre-fill the form.
+          await unregisterMcpServer(this.context);
           await this.context.secrets.delete('jira-lens.token');
           result = { ok: true };
           break;
         }
 
-        // ── Optional jira-mcp install (for AI Chat integration) ──────────
-        case 'GET_MCP_BANNER_STATE': {
-          const dismissed = this.context.globalState.get<boolean>('jira-lens.mcpBannerDismissed', false);
-          const installed = isMcpInstalled();
-          result = { show: !dismissed && !installed };
+        // ── Write operations (Phase 2) ───────────────────────────────────────
+        case 'GET_TRANSITIONS': {
+          const creds = await this.requireCreds();
+          result = await jiraGetTransitions(creds, msg.key);
           break;
         }
-        case 'INSTALL_MCP_OPTIONAL': {
-          const workspaceFolder =
-            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
-          const prompt = isMcpInstalled()
-            ? buildMcpUpdatePrompt(workspaceFolder)
-            : buildMcpInstallPrompt(workspaceFolder);
-          await vscode.commands.executeCommand('workbench.action.chat.open', { query: prompt });
-          result = { ok: true };
+        case 'TRANSITION_ISSUE': {
+          const creds = await this.requireCreds();
+          result = await jiraTransitionIssue(creds, msg.key, msg.transitionId, msg.comment);
           break;
         }
-        case 'DISMISS_MCP_BANNER': {
-          await this.context.globalState.update('jira-lens.mcpBannerDismissed', true);
-          result = { ok: true };
+        case 'ASSIGN_ISSUE': {
+          const creds = await this.requireCreds();
+          result = await jiraAssignIssue(creds, msg.key, msg.accountId);
           break;
         }
-        case 'GET_MCP_INSTALL_STATE': {
-          result = { installed: isMcpInstalled() };
+        case 'SEARCH_USERS': {
+          const creds = await this.requireCreds();
+          result = await jiraSearchUsers(creds, msg.query, msg.maxResults);
+          break;
+        }
+        case 'ADD_COMMENT': {
+          const creds = await this.requireCreds();
+          result = await jiraAddComment(creds, msg.key, msg.body);
+          break;
+        }
+        case 'UPDATE_ISSUE': {
+          const creds = await this.requireCreds();
+          const m = msg as { key: string; updates: Record<string, unknown> };
+          result = await jiraUpdateIssue(creds, m.key, m.updates as Parameters<typeof jiraUpdateIssue>[2]);
+          break;
+        }
+        case 'CREATE_ISSUE': {
+          const creds = await this.requireCreds();
+          const m = msg as { opts: Record<string, unknown> };
+          result = await jiraCreateIssue(creds, m.opts as Parameters<typeof jiraCreateIssue>[1]);
+          break;
+        }
+        case 'FETCH_LINK_TYPES': {
+          const creds = await this.requireCreds();
+          result = await jiraFetchLinkTypes(creds);
+          break;
+        }
+        case 'LINK_ISSUES': {
+          const creds = await this.requireCreds();
+          result = await jiraLinkIssues(creds, msg.sourceKey, msg.targetKey, msg.linkTypeName);
           break;
         }
 
@@ -430,6 +366,12 @@ class JiraLensPanel {
     } catch (err) {
       void this.panel.webview.postMessage({ id: msg.id, error: (err as Error).message });
     }
+  }
+
+  private async requireCreds(): Promise<Credentials> {
+    const creds = await loadCredentials(this.context);
+    if (!creds) throw new Error('Not connected. Please complete setup first.');
+    return creds;
   }
 }
 

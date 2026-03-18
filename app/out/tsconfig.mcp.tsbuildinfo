@@ -1,0 +1,1 @@
+{"root":["../src/mcp/server.ts","../src/cli/bulk-assign.ts","../src/cli/bulk-move.ts","../src/cli/bulk-transition.ts","../src/cli/query.ts","../src/lib/confluence.ts","../src/lib/jira-client.ts","../src/lib/md-to-adf.d.ts"],"version":"5.9.3"}

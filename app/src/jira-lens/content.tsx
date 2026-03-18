@@ -13,16 +13,7 @@
  * Step 2 sub-navigation:
  *   Level 1  ProjectList   — shows all projects
  *   Level 2  IssueList     — shows all issues in the selected project
- *   Level 3  IssueDetail   — shows full detail for a single issue
- *
- * NAVIGATION ACTIONS (Step 2 only — rendered in BasicLayout.Navigation end slot)
- * ───────────────────
- *   Refresh          — resets sub-navigation to project list; uses `refreshKey` to
- *                      force-remount the step-2 subtree so all data is re-fetched
- *   Reset connection — clears SecretStorage token and returns to Step 0 (credential form)
- *
- * After reaching Step 2, a dismissable banner may suggest installing jira-mcp
- * for Cursor AI Chat integration (optional enhancement).
+ *   Level 3  IssueDetail   — shows full detail for a single issue (with write actions)
  *
  * DATA FLOW
  * ─────────
@@ -33,7 +24,7 @@
  * In browser dev mode, initialStep defaults to 2 (skip onboarding entirely).
  */
 
-import React, { useState, useCallback, useEffect, Component } from 'react';
+import React, { useState, useCallback, useEffect, useRef, Component } from 'react';
 import { chartNeutral, chartRainbow, use } from '../global-styles/colors';
 import { BasicLayout } from '../components/layout/basic-layout';
 import { Button } from '../components/general/button';
@@ -42,25 +33,24 @@ import {
   onPush,
   saveCredentials,
   resetCredentials,
-  getMcpInstallState,
-  getMcpBannerState,
-  installMcpOptional,
-  dismissMcpBanner,
   getProjects,
   getIssues,
   getIssue,
+  getTransitions,
+  transitionIssue,
+  searchUsers,
+  assignIssue,
+  addComment,
   type ConnectProgressMessage,
   type JiraProject,
   type JiraIssueSummary,
   type JiraIssueDetail,
+  type JiraTransition,
+  type JiraUser,
 } from './transport';
 
 // ── Project filter ────────────────────────────────────────────────────────────
-// Only these Jira project keys will be shown in the UI.
-// In the VS Code extension, the extension host returns all accessible projects;
-// this filters client-side. Set to [] to show all projects.
 const JIRA_PROJECT_KEYS: string[] = ['JL'];
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -92,139 +82,131 @@ function ErrorBox({ message }: { message: string }) {
   );
 }
 
+function Toast({ message, type, onDismiss }: { message: string; type: 'success' | 'error'; onDismiss: () => void }) {
+  useEffect(() => {
+    const timer = setTimeout(onDismiss, 3000);
+    return () => clearTimeout(timer);
+  }, [onDismiss]);
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        bottom: 16,
+        right: 16,
+        padding: '10px 16px',
+        borderRadius: 6,
+        fontSize: 13,
+        background: type === 'success' ? chartRainbow['green-20'] : chartRainbow['red-20'],
+        color: type === 'success' ? chartRainbow['green-100'] : chartRainbow['red-100'],
+        border: `1px solid ${type === 'success' ? chartRainbow['green-60'] : chartRainbow['red-60']}`,
+        zIndex: 9999,
+        cursor: 'pointer',
+      }}
+      onClick={onDismiss}
+    >
+      {message}
+    </div>
+  );
+}
+
 // ── Step 0: Credential Input ──────────────────────────────────────────────────
 
 function StepCredentials({ onSaved }: { onSaved: () => void }) {
   const [domain, setDomain] = useState('');
   const [email, setEmail] = useState('');
   const [token, setToken] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!domain.trim() || !email.trim() || !token.trim()) {
-      setError('All fields are required.');
-      return;
-    }
-    setLoading(true);
-    setError(null);
+    if (!domain || !email || !token) return;
+    setSaving(true);
     try {
       await saveCredentials(domain.trim(), email.trim(), token.trim());
       onSaved();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save credentials.');
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   };
 
   const inputStyle: React.CSSProperties = {
-    display: 'block',
     width: '100%',
-    padding: '8px 10px',
-    fontSize: 13,
-    background: use['bg-prime'],
+    padding: '8px 12px',
+    fontSize: 14,
     border: `1px solid ${use['border-prime']}`,
     borderRadius: 4,
-    color: 'inherit',
+    background: use['bg-prime'],
     boxSizing: 'border-box',
-    marginBottom: 12,
-  };
-
-  const labelStyle: React.CSSProperties = {
-    display: 'block',
-    fontSize: 12,
-    color: chartNeutral['6'],
-    marginBottom: 4,
   };
 
   return (
-    <div style={{ maxWidth: 400 }}>
-      <h3 style={{ marginBottom: 8 }}>Connect to Jira</h3>
-      <p style={{ color: chartNeutral['6'], fontSize: 14, marginBottom: 20 }}>
-        Enter your Jira credentials. Your API token is stored securely in VS Code's encrypted
-        secret storage — never in version control.
-      </p>
-
-      <form onSubmit={handleSubmit}>
-        <label style={labelStyle}>
+    <form onSubmit={handleSubmit}>
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ display: 'block', marginBottom: 6, fontSize: 13, fontWeight: 600 }}>
           Jira domain
-          <input
-            style={inputStyle}
-            type="text"
-            placeholder="your-company.atlassian.net"
-            value={domain}
-            onChange={e => setDomain(e.target.value)}
-            autoComplete="off"
-          />
         </label>
-
-        <label style={labelStyle}>
+        <input
+          type="text"
+          value={domain}
+          onChange={e => setDomain(e.target.value)}
+          placeholder="your-company.atlassian.net"
+          style={inputStyle}
+          autoFocus
+        />
+      </div>
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ display: 'block', marginBottom: 6, fontSize: 13, fontWeight: 600 }}>
           Email
-          <input
-            style={inputStyle}
-            type="email"
-            placeholder="you@your-company.com"
-            value={email}
-            onChange={e => setEmail(e.target.value)}
-            autoComplete="email"
-          />
         </label>
-
-        <label style={labelStyle}>
+        <input
+          type="email"
+          value={email}
+          onChange={e => setEmail(e.target.value)}
+          placeholder="you@company.com"
+          style={inputStyle}
+        />
+      </div>
+      <div style={{ marginBottom: 24 }}>
+        <label style={{ display: 'block', marginBottom: 6, fontSize: 13, fontWeight: 600 }}>
           API token
-          <input
-            style={inputStyle}
-            type="password"
-            placeholder="ATATT3x…"
-            value={token}
-            onChange={e => setToken(e.target.value)}
-            autoComplete="off"
-          />
         </label>
-
-        <p style={{ fontSize: 12, color: chartNeutral['6'], marginBottom: 16 }}>
-          Create a token at{' '}
-          <a
-            href="https://id.atlassian.com/manage-profile/security/api-tokens"
-            style={{ color: chartRainbow['blue-100'] }}
-          >
-            id.atlassian.com → Security → API tokens
+        <input
+          type="password"
+          value={token}
+          onChange={e => setToken(e.target.value)}
+          placeholder="Paste your Atlassian API token"
+          style={inputStyle}
+        />
+        <div style={{ fontSize: 12, color: chartNeutral['6'], marginTop: 4 }}>
+          Generate at{' '}
+          <a href="https://id.atlassian.com/manage-profile/security/api-tokens" style={{ color: chartRainbow['blue-100'] }}>
+            id.atlassian.com
           </a>
-        </p>
-
-        {error && <ErrorBox message={error} />}
-
-        <button
-          type="submit"
-          disabled={loading}
-          style={{
-            padding: '10px 24px',
-            fontSize: 14,
-            background: chartRainbow['blue-100'],
-            color: chartNeutral['0'],
-            border: 'none',
-            borderRadius: 6,
-            cursor: loading ? 'not-allowed' : 'pointer',
-            opacity: loading ? 0.7 : 1,
-          }}
-        >
-          {loading ? 'Saving…' : 'Connect'}
-        </button>
-      </form>
-    </div>
+        </div>
+      </div>
+      <button
+        type="submit"
+        disabled={saving || !domain || !email || !token}
+        style={{
+          padding: '10px 24px',
+          fontSize: 14,
+          fontWeight: 600,
+          background: chartRainbow['blue-100'],
+          color: chartNeutral['0'],
+          border: 'none',
+          borderRadius: 4,
+          cursor: saving ? 'not-allowed' : 'pointer',
+          opacity: saving ? 0.7 : 1,
+        }}
+      >
+        {saving ? 'Connecting…' : 'Connect'}
+      </button>
+    </form>
   );
 }
 
 // ── Step 1: Connecting ────────────────────────────────────────────────────────
-
-const STAGE_LABELS: Record<string, string> = {
-  validating: 'Validating credentials…',
-  fetching:   'Fetching projects…',
-  done:       'Connected',
-  error:      'Connection failed',
-};
 
 function StepConnecting({
   progress,
@@ -234,56 +216,46 @@ function StepConnecting({
   onRetry: () => void;
 }) {
   const stage = progress?.stage ?? 'validating';
-  const isError = stage === 'error';
+
+  const stages: { key: string; label: string }[] = [
+    { key: 'validating', label: 'Validating credentials' },
+    { key: 'fetching', label: 'Fetching projects' },
+    { key: 'done', label: 'Connected!' },
+  ];
 
   return (
-    <div style={{ maxWidth: 360 }}>
-      <h3 style={{ marginBottom: 16 }}>Connecting to Jira</h3>
-
-      {(['validating', 'fetching', 'done'] as const).map(s => {
-        const steps = ['validating', 'fetching', 'done'] as const;
-        const currentIdx = steps.indexOf(stage as typeof steps[number]);
-        const stepIdx = steps.indexOf(s);
-        const isDone = stepIdx < currentIdx || (stage === 'done' && stepIdx <= currentIdx);
-        const isCurrent = s === stage && stage !== 'done';
-        const color = isDone || stage === 'done'
-          ? chartRainbow['green-100']
-          : isCurrent
-            ? chartRainbow['blue-100']
-            : chartNeutral['4'];
-
+    <div>
+      {stages.map(s => {
+        const isActive = s.key === stage;
+        const isDone = stages.findIndex(x => x.key === stage) > stages.findIndex(x => x.key === s.key);
         return (
           <div
-            key={s}
-            style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}
+            key={s.key}
+            style={{
+              padding: '8px 0',
+              fontSize: 14,
+              color: isDone ? chartRainbow['green-100'] : isActive ? chartNeutral['12'] : chartNeutral['6'],
+              fontWeight: isActive ? 600 : 400,
+            }}
           >
-            <span
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: '50%',
-                background: color,
-                flexShrink: 0,
-              }}
-            />
-            <span style={{ fontSize: 14, color }}>
-              {STAGE_LABELS[s]}
-            </span>
+            {isDone ? '✓ ' : isActive ? '● ' : '○ '}
+            {s.label}
           </div>
         );
       })}
 
-      {isError && (
-        <div style={{ marginTop: 8 }}>
-          <ErrorBox message={progress?.message ?? 'Connection failed. Check your credentials and try again.'} />
+      {stage === 'error' && (
+        <div style={{ marginTop: 16 }}>
+          <ErrorBox message={progress?.message ?? 'Connection failed'} />
           <button
             type="button"
             onClick={onRetry}
             style={{
-              padding: '8px 18px',
+              padding: '8px 16px',
               fontSize: 13,
-              background: 'transparent',
-              border: `1px solid ${use['border-prime']}`,
+              background: chartRainbow['blue-100'],
+              color: chartNeutral['0'],
+              border: 'none',
               borderRadius: 4,
               cursor: 'pointer',
             }}
@@ -299,20 +271,23 @@ function StepConnecting({
 // ── Level 1: Project List ─────────────────────────────────────────────────────
 
 function ProjectList({ onSelect }: { onSelect: (project: JiraProject) => void }) {
-  const [projects, setProjects] = useState<JiraProject[]>([]);
+  const [projects, setProjects] = useState<JiraProject[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
+      setLoading(true);
+      setError(null);
       try {
-        const data = await getProjects();
-        const filtered = JIRA_PROJECT_KEYS.length > 0
-          ? data.filter(p => JIRA_PROJECT_KEYS.includes(p.key))
-          : data;
-        setProjects(filtered);
+        let data = await getProjects();
+        if (JIRA_PROJECT_KEYS.length > 0) {
+          data = data.filter(p => JIRA_PROJECT_KEYS.includes(p.key));
+        }
+        setProjects(data);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Request failed');
+        setProjects(null);
       } finally {
         setLoading(false);
       }
@@ -321,37 +296,32 @@ function ProjectList({ onSelect }: { onSelect: (project: JiraProject) => void })
 
   if (loading) return <p style={{ color: chartNeutral['6'] }}>Loading projects…</p>;
   if (error) return <ErrorBox message={error} />;
+  if (!projects || projects.length === 0) {
+    return <p style={{ color: chartNeutral['6'] }}>No projects found</p>;
+  }
 
   return (
     <div>
-      {projects.length === 0 ? (
-        <p style={{ color: chartNeutral['6'] }}>
-          No matching projects found. Check JIRA_PROJECT_KEYS in content.tsx.
-        </p>
-      ) : (
-        projects.map(p => (
-          <button
-            key={p.key}
-            type="button"
-            onClick={() => onSelect(p)}
-            style={{
-              display: 'block',
-              width: '100%',
-              textAlign: 'left',
-              padding: '12px 16px',
-              marginBottom: 8,
-              background: use['bg-prime'],
-              border: `1px solid ${use['border-prime']}`,
-              borderRadius: 6,
-              cursor: 'pointer',
-              fontSize: 14,
-            }}
-          >
-            <strong>{p.name}</strong>{' '}
-            <span style={{ color: chartNeutral['6'] }}>({p.key})</span>
-          </button>
-        ))
-      )}
+      {projects.map(p => (
+        <button
+          key={p.key}
+          type="button"
+          onClick={() => onSelect(p)}
+          style={{
+            display: 'block',
+            width: '100%',
+            textAlign: 'left',
+            padding: 12,
+            border: `1px solid ${use['border-prime']}`,
+            marginBottom: 8,
+            borderRadius: 4,
+            background: use['bg-prime'],
+            cursor: 'pointer',
+          }}
+        >
+          <strong>{p.key}</strong> — {p.name}
+        </button>
+      ))}
     </div>
   );
 }
@@ -368,7 +338,7 @@ function IssueList({
   onSelectIssue: (issue: JiraIssueSummary) => void;
 }) {
   const [issues, setIssues] = useState<JiraIssueSummary[] | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const fetchIssues = useCallback(async () => {
@@ -476,22 +446,23 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
   const [issue, setIssue] = useState<JiraIssueDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const data = await getIssue(issueKey);
-        setIssue(data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Request failed');
-        setIssue(null);
-      } finally {
-        setLoading(false);
-      }
-    })();
+  const fetchDetail = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await getIssue(issueKey);
+      setIssue(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Request failed');
+      setIssue(null);
+    } finally {
+      setLoading(false);
+    }
   }, [issueKey]);
+
+  useEffect(() => { void fetchDetail(); }, [fetchDetail]);
 
   if (loading) return <p style={{ color: chartNeutral['6'] }}>Loading issue…</p>;
   if (error) return <ErrorBox message={error} />;
@@ -504,6 +475,8 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
 
   return (
     <div>
+      {toast && <Toast message={toast.message} type={toast.type} onDismiss={() => setToast(null)} />}
+
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
         <button
           type="button"
@@ -520,6 +493,22 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
           ← Back
         </button>
         <span style={{ fontWeight: 600 }}>{issue.key}</span>
+        <button
+          type="button"
+          onClick={fetchDetail}
+          style={{
+            marginLeft: 'auto',
+            padding: '6px 12px',
+            fontSize: 13,
+            background: chartRainbow['blue-100'],
+            color: chartNeutral['0'],
+            border: 'none',
+            borderRadius: 4,
+            cursor: 'pointer',
+          }}
+        >
+          Refresh
+        </button>
       </div>
 
       <div style={{ marginBottom: 16 }}>
@@ -530,17 +519,40 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
           <span style={{ fontWeight: 600, fontSize: 18 }}>{f.summary}</span>
         </div>
 
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-          <span style={{ padding: '2px 8px', borderRadius: 4, background: chartRainbow['blue-20'], color: chartRainbow['blue-100'], fontSize: 12 }}>
-            {f.status?.name ?? '-'}
-          </span>
+        {/* Status with transition dropdown */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
+          <TransitionDropdown
+            issueKey={issue.key}
+            currentStatus={f.status?.name ?? '-'}
+            onTransitioned={(newStatus) => {
+              setIssue(prev => prev ? {
+                ...prev,
+                fields: { ...prev.fields, status: { name: newStatus } },
+              } : prev);
+              setToast({ message: `Status changed to "${newStatus}"`, type: 'success' });
+            }}
+            onError={(msg) => setToast({ message: msg, type: 'error' })}
+          />
           {f.priority?.name && (
             <span style={{ color: chartNeutral['6'], fontSize: 13 }}>{f.priority.name}</span>
           )}
         </div>
 
+        {/* Assignee with picker */}
         <div style={{ fontSize: 13, color: chartNeutral['6'], marginBottom: 16 }}>
-          Assignee: {f.assignee?.displayName ?? 'Unassigned'} · Reporter: {f.reporter?.displayName ?? '-'}
+          <AssigneePicker
+            issueKey={issue.key}
+            currentAssignee={f.assignee?.displayName ?? 'Unassigned'}
+            onAssigned={(name) => {
+              setIssue(prev => prev ? {
+                ...prev,
+                fields: { ...prev.fields, assignee: name ? { displayName: name } : null },
+              } : prev);
+              setToast({ message: name ? `Assigned to ${name}` : 'Unassigned', type: 'success' });
+            }}
+            onError={(msg) => setToast({ message: msg, type: 'error' })}
+          />
+          {' · '}Reporter: {f.reporter?.displayName ?? '-'}
           {f.created && ` · Created: ${f.created.slice(0, 10)}`}
           {f.updated && ` · Updated: ${f.updated.slice(0, 10)}`}
           {f.duedate && ` · Due: ${f.duedate}`}
@@ -590,9 +602,10 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
           </div>
         )}
 
-        {f.comment?.comments && f.comment.comments.length > 0 && (
-          <div>
-            <strong style={{ fontSize: 13 }}>Comments</strong>
+        {/* Comments section with add-comment form */}
+        <div style={{ marginBottom: 16 }}>
+          <strong style={{ fontSize: 13 }}>Comments</strong>
+          {f.comment?.comments && f.comment.comments.length > 0 && (
             <div style={{ marginTop: 8 }}>
               {f.comment.comments.map((c, idx) => (
                 <div
@@ -605,9 +618,349 @@ function IssueDetail({ issueKey, onBack }: { issueKey: string; onBack: () => voi
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          )}
+          <AddCommentBox
+            issueKey={issue.key}
+            onCommentAdded={(body) => {
+              setIssue(prev => {
+                if (!prev) return prev;
+                const existing = prev.fields.comment?.comments ?? [];
+                return {
+                  ...prev,
+                  fields: {
+                    ...prev.fields,
+                    comment: {
+                      comments: [
+                        ...existing,
+                        { author: { displayName: 'You' }, body: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: body }] }] }, created: new Date().toISOString() },
+                      ],
+                    },
+                  },
+                };
+              });
+              setToast({ message: 'Comment added', type: 'success' });
+            }}
+            onError={(msg) => setToast({ message: msg, type: 'error' })}
+          />
+        </div>
       </div>
+    </div>
+  );
+}
+
+// ── Write Action: Transition Dropdown ─────────────────────────────────────────
+
+function TransitionDropdown({
+  issueKey,
+  currentStatus,
+  onTransitioned,
+  onError,
+}: {
+  issueKey: string;
+  currentStatus: string;
+  onTransitioned: (newStatus: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const [transitions, setTransitions] = useState<JiraTransition[] | null>(null);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const handleOpen = async () => {
+    if (open) { setOpen(false); return; }
+    setLoading(true);
+    try {
+      const data = await getTransitions(issueKey);
+      setTransitions(data);
+      setOpen(true);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Failed to load transitions');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSelect = async (t: JiraTransition) => {
+    setOpen(false);
+    const previousStatus = currentStatus;
+    onTransitioned(t.to || t.name);
+    try {
+      await transitionIssue(issueKey, t.id);
+    } catch (err) {
+      onTransitioned(previousStatus);
+      onError(err instanceof Error ? err.message : 'Transition failed');
+    }
+  };
+
+  return (
+    <div style={{ position: 'relative', display: 'inline-block' }}>
+      <button
+        type="button"
+        onClick={handleOpen}
+        disabled={loading}
+        style={{
+          padding: '2px 10px',
+          borderRadius: 4,
+          background: chartRainbow['blue-20'],
+          color: chartRainbow['blue-100'],
+          fontSize: 12,
+          border: `1px solid ${chartRainbow['blue-60']}`,
+          cursor: 'pointer',
+        }}
+      >
+        {loading ? '…' : currentStatus} ▾
+      </button>
+      {open && transitions && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            marginTop: 4,
+            background: use['bg-prime'],
+            border: `1px solid ${use['border-prime']}`,
+            borderRadius: 4,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            zIndex: 100,
+            minWidth: 160,
+          }}
+        >
+          {transitions.map(t => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => handleSelect(t)}
+              style={{
+                display: 'block',
+                width: '100%',
+                textAlign: 'left',
+                padding: '8px 12px',
+                fontSize: 13,
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                borderBottom: `1px solid ${use['border-prime']}`,
+              }}
+            >
+              {t.name} → <strong>{t.to}</strong>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Write Action: Assignee Picker ─────────────────────────────────────────────
+
+function AssigneePicker({
+  issueKey,
+  currentAssignee,
+  onAssigned,
+  onError,
+}: {
+  issueKey: string;
+  currentAssignee: string;
+  onAssigned: (displayName: string | null) => void;
+  onError: (msg: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [users, setUsers] = useState<JiraUser[]>([]);
+  const [searching, setSearching] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  const handleSearch = useCallback((q: string) => {
+    setQuery(q);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!q.trim()) { setUsers([]); return; }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const result = await searchUsers(q.trim());
+        setUsers(result);
+      } catch {
+        setUsers([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+  }, []);
+
+  const handleSelect = async (user: JiraUser | null) => {
+    setOpen(false);
+    setQuery('');
+    setUsers([]);
+    const previousAssignee = currentAssignee;
+    onAssigned(user?.displayName ?? null);
+    try {
+      await assignIssue(issueKey, user?.accountId ?? null);
+    } catch (err) {
+      onAssigned(previousAssignee === 'Unassigned' ? null : previousAssignee);
+      onError(err instanceof Error ? err.message : 'Assign failed');
+    }
+  };
+
+  return (
+    <span style={{ position: 'relative', display: 'inline' }}>
+      Assignee:{' '}
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        style={{
+          background: 'none',
+          border: 'none',
+          cursor: 'pointer',
+          color: 'inherit',
+          padding: 0,
+          textDecoration: 'underline',
+          textDecorationStyle: 'dotted' as const,
+          fontSize: 'inherit',
+        }}
+      >
+        {currentAssignee}
+      </button>
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            marginTop: 4,
+            background: use['bg-prime'],
+            border: `1px solid ${use['border-prime']}`,
+            borderRadius: 4,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            zIndex: 100,
+            minWidth: 220,
+            padding: 8,
+          }}
+        >
+          <input
+            type="text"
+            value={query}
+            onChange={e => handleSearch(e.target.value)}
+            placeholder="Search users…"
+            autoFocus
+            style={{
+              width: '100%',
+              padding: '6px 8px',
+              fontSize: 13,
+              border: `1px solid ${use['border-prime']}`,
+              borderRadius: 4,
+              boxSizing: 'border-box',
+              marginBottom: 4,
+            }}
+          />
+          {searching && <div style={{ fontSize: 12, color: chartNeutral['6'], padding: 4 }}>Searching…</div>}
+          <button
+            type="button"
+            onClick={() => handleSelect(null)}
+            style={{
+              display: 'block',
+              width: '100%',
+              textAlign: 'left',
+              padding: '6px 8px',
+              fontSize: 13,
+              background: 'transparent',
+              border: 'none',
+              cursor: 'pointer',
+              color: chartNeutral['6'],
+            }}
+          >
+            Unassign
+          </button>
+          {users.map(u => (
+            <button
+              key={u.accountId}
+              type="button"
+              onClick={() => handleSelect(u)}
+              style={{
+                display: 'block',
+                width: '100%',
+                textAlign: 'left',
+                padding: '6px 8px',
+                fontSize: 13,
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              {u.displayName}
+              {u.email && <span style={{ color: chartNeutral['6'], marginLeft: 4 }}>({u.email})</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
+
+// ── Write Action: Add Comment ─────────────────────────────────────────────────
+
+function AddCommentBox({
+  issueKey,
+  onCommentAdded,
+  onError,
+}: {
+  issueKey: string;
+  onCommentAdded: (body: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const [text, setText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!text.trim() || submitting) return;
+    setSubmitting(true);
+    const body = text.trim();
+    setText('');
+    try {
+      await addComment(issueKey, body);
+      onCommentAdded(body);
+    } catch (err) {
+      setText(body);
+      onError(err instanceof Error ? err.message : 'Failed to add comment');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <textarea
+        value={text}
+        onChange={e => setText(e.target.value)}
+        placeholder="Add a comment…"
+        rows={3}
+        style={{
+          width: '100%',
+          padding: '8px 12px',
+          fontSize: 13,
+          border: `1px solid ${use['border-prime']}`,
+          borderRadius: 4,
+          resize: 'vertical',
+          boxSizing: 'border-box',
+          background: use['bg-prime'],
+        }}
+      />
+      <button
+        type="button"
+        onClick={handleSubmit}
+        disabled={!text.trim() || submitting}
+        style={{
+          marginTop: 4,
+          padding: '6px 14px',
+          fontSize: 13,
+          background: chartRainbow['blue-100'],
+          color: chartNeutral['0'],
+          border: 'none',
+          borderRadius: 4,
+          cursor: !text.trim() || submitting ? 'not-allowed' : 'pointer',
+          opacity: !text.trim() || submitting ? 0.6 : 1,
+        }}
+      >
+        {submitting ? 'Posting…' : 'Add comment'}
+      </button>
     </div>
   );
 }
@@ -648,115 +1001,16 @@ function Breadcrumb({
   );
 }
 
-// ── MCP Install Banner (optional, shown on main interface) ───────────────────
-
-function McpBanner() {
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    getMcpBannerState().then(({ show }) => setVisible(show)).catch(() => {});
-  }, []);
-
-  if (!visible) return null;
-
-  const handleDismiss = () => {
-    setVisible(false);
-    dismissMcpBanner().catch(() => {});
-  };
-
-  const handleInstall = () => {
-    installMcpOptional();
-    handleDismiss();
-  };
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '10px 14px',
-        marginBottom: 16,
-        background: chartRainbow['blue-20'],
-        border: `1px solid ${chartRainbow['blue-60']}`,
-        borderRadius: 6,
-        fontSize: 13,
-      }}
-    >
-      <span style={{ flex: 1 }}>
-        <strong>Enhance your workflow:</strong> Install{' '}
-        <a
-          href="https://github.com/WenchuanLiliZhao/jira-mcp"
-          style={{ color: chartRainbow['blue-100'] }}
-        >
-          jira-mcp
-        </a>{' '}
-        to use Jira directly in Cursor AI Chat.
-      </span>
-      <button
-        type="button"
-        onClick={handleInstall}
-        style={{
-          padding: '5px 12px',
-          fontSize: 12,
-          background: chartRainbow['blue-100'],
-          color: chartNeutral['0'],
-          border: 'none',
-          borderRadius: 4,
-          cursor: 'pointer',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        Install via AI
-      </button>
-      <button
-        type="button"
-        onClick={handleDismiss}
-        style={{
-          padding: '5px 8px',
-          fontSize: 12,
-          background: 'transparent',
-          border: 'none',
-          cursor: 'pointer',
-          color: chartNeutral['6'],
-        }}
-        title="Dismiss"
-      >
-        ✕
-      </button>
-    </div>
-  );
-}
-
 // ── Navigation actions ────────────────────────────────────────────────────────
-//
-// AI hint: JiraNavActions is the single place to add/remove global action buttons
-// that appear in the BasicLayout navigation bar. All three buttons are always
-// visible regardless of the current step — no step-based conditional rendering.
-//
-// Prop contract:
-//   onRefresh         — increment refreshKey in <Content> to force-remount the
-//                       step-2 subtree, re-fetching all Jira data
-//   onResetConnection — delete stored token (via transport.resetCredentials) and
-//                       transition back to Step 0 (credential form)
-//   mcpInstalled      — whether ~/Jira-MCP/package.json exists; controls the
-//                       icon and tooltip of the jira-mcp button
-//   onInstallMcp      — opens Cursor Chat with the jira-mcp install/update prompt
-//
-// To add a new action: add a <Button> here and the corresponding callback to the
-// props interface; wire it in the <Content> component below.
 
 interface JiraNavActionsProps {
   onRefresh: () => void;
   onResetConnection: () => void;
-  mcpInstalled: boolean;
-  onInstallMcp: () => void;
 }
 
-function JiraNavActions({ onRefresh, onResetConnection, mcpInstalled, onInstallMcp }: JiraNavActionsProps) {
+function JiraNavActions({ onRefresh, onResetConnection }: JiraNavActionsProps) {
   return (
     <div style={{ display: 'flex', gap: 4 }}>
-      {/* Refresh: re-fetches all Jira data by remounting the main interface */}
       <Button
         variant="ghost"
         size="medium"
@@ -766,7 +1020,6 @@ function JiraNavActions({ onRefresh, onResetConnection, mcpInstalled, onInstallM
       >
         Refresh
       </Button>
-      {/* Reset connection: clears stored credentials → returns to credential form */}
       <Button
         variant="ghost"
         size="medium"
@@ -776,21 +1029,11 @@ function JiraNavActions({ onRefresh, onResetConnection, mcpInstalled, onInstallM
       >
         Reset Jira connection
       </Button>
-      {/* jira-mcp: install if missing, update if present; opens Cursor Chat with prompt */}
-      <Button
-        variant="ghost"
-        size="medium"
-        startIcon={mcpInstalled ? 'system_update' : 'download'}
-        onClick={onInstallMcp}
-        title={mcpInstalled ? 'Update jira-mcp' : 'Install jira-mcp for AI Chat'}
-      >
-        {mcpInstalled ? 'Update jira-mcp' : 'Install jira-mcp for AI Chat'}
-      </Button>
     </div>
   );
 }
 
-// ── Error boundary (surfaces React errors in webview for debugging) ─────────────
+// ── Error boundary ────────────────────────────────────────────────────────────
 
 export class JiraLensErrorBoundary extends Component<
   { children: React.ReactNode },
@@ -827,20 +1070,10 @@ export const Content: React.FC = () => {
   const [step, setStep] = useState<0 | 1 | 2>(initialStep as 0 | 1 | 2);
   const [progress, setProgress] = useState<ConnectProgressMessage | null>(null);
 
-  // Step 2: sub-navigation state
   const [selectedProject, setSelectedProject] = useState<JiraProject | null>(null);
   const [selectedIssue, setSelectedIssue] = useState<JiraIssueSummary | null>(null);
 
-  // Incrementing this key force-remounts the entire step-2 subtree, triggering
-  // fresh data fetches in ProjectList / IssueList / IssueDetail.
   const [refreshKey, setRefreshKey] = useState(0);
-
-  // Whether ~/Jira-MCP/package.json exists — controls the Nav jira-mcp button icon/tooltip.
-  const [mcpInstalled, setMcpInstalled] = useState(false);
-
-  useEffect(() => {
-    getMcpInstallState().then(({ installed }) => setMcpInstalled(installed)).catch(() => {});
-  }, []);
 
   useEffect(() => {
     return onPush(msg => {
@@ -863,19 +1096,12 @@ export const Content: React.FC = () => {
     setStep(0);
   };
 
-  // Nav action: re-fetch all data by resetting sub-nav and remounting the subtree.
   const handleRefresh = useCallback(() => {
     setSelectedProject(null);
     setSelectedIssue(null);
     setRefreshKey(k => k + 1);
   }, []);
 
-  // Nav action: open Cursor Chat with the jira-mcp install/update prompt.
-  const handleInstallMcp = useCallback(() => {
-    installMcpOptional();
-  }, []);
-
-  // Nav action: wipe the stored token and return to the credential form.
   const handleResetConnection = useCallback(async () => {
     await resetCredentials();
     setSelectedProject(null);
@@ -888,7 +1114,6 @@ export const Content: React.FC = () => {
   return (
     <BasicLayout
       navigation={{
-        // "Jira Lens" title always visible in the nav start slot.
         start: [
           <span
             key="title"
@@ -897,15 +1122,11 @@ export const Content: React.FC = () => {
             Jira Lens
           </span>,
         ],
-        // All three action buttons are always visible regardless of step.
-        // AI hint: to conditionalize per step, wrap in a ternary here.
         end: [
           <JiraNavActions
             key="nav-actions"
             onRefresh={handleRefresh}
             onResetConnection={handleResetConnection}
-            mcpInstalled={mcpInstalled}
-            onInstallMcp={handleInstallMcp}
           />,
         ],
       }}
@@ -927,11 +1148,8 @@ export const Content: React.FC = () => {
           <StepConnecting progress={progress} onRetry={handleRetryCredentials} />
         )}
 
-        {/* key={refreshKey} remounts this entire section on each refresh, re-fetching all data */}
         {step === 2 && (
           <div key={refreshKey}>
-            <McpBanner />
-
             <Breadcrumb
               project={selectedProject}
               issueKey={selectedIssue?.key ?? null}

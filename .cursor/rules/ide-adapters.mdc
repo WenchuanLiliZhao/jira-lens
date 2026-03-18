@@ -1,0 +1,35 @@
+---
+description: Enforce that all IDE-specific code lives in app/src/ide-adapters/
+globs: app/src/**/*.ts
+alwaysApply: false
+---
+
+# IDE Adapter Rule
+
+All code that behaves differently per IDE (Cursor, VS Code, Trae, ...) **must** live in `app/src/ide-adapters/`.
+
+## Never do this
+
+```typescript
+// ❌ BAD — IDE branch outside ide-adapters/
+if (vscode.env.appName.includes('cursor')) {
+  writeCursorMcpConfig(...);
+} else {
+  writeVsCodeMcpConfig(...);
+}
+```
+
+## Always do this
+
+```typescript
+// ✅ GOOD — call through the adapter
+await getIdeAdapter().registerMcp(credPath, serverPath);
+```
+
+## Adding a new IDE
+
+1. Create `app/src/ide-adapters/{ide-name}.ts` implementing `IdeAdapter` from `types.ts`.
+2. Add one detection branch in `app/src/ide-adapters/index.ts`.
+3. Update `app/src/ide-adapters/README.md` adapter table.
+
+See `app/src/ide-adapters/README.md` for full documentation.
