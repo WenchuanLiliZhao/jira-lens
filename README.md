@@ -33,7 +33,7 @@ Key properties:
 
 ## Relationship to `jira-mcp`
 
-[`jira-mcp`](https://github.com/WenchuanLiliZhao/jira-mcp) is a **separate, optional** MCP server that connects **Cursor AI Chat** to Jira. Jira Lens does **not** depend on it — the extension has its own built-in Jira API client and manages credentials independently via VS Code SecretStorage.
+`jira-mcp` is a **separate, optional** MCP server that connects **Cursor AI Chat** to Jira. Jira Lens does **not** depend on it — the extension has its own built-in Jira API client and manages credentials independently via VS Code SecretStorage.
 
 ```
 Jira Lens Extension ──── own Jira API client ──── Jira Cloud API
@@ -66,7 +66,7 @@ jira-mcp (optional) ──── MCP server ────────────
 
 - **Extension:** VS Code Extension API (TypeScript)
 - **UI components:** React + TypeScript + SCSS (in `app/`)
-- **Jira layer:** [`jira-mcp`](https://github.com/WenchuanLiliZhao/jira-mcp) (Node.js, Jira Cloud REST API)
+- **Jira layer:** `jira-mcp` (Node.js, Jira Cloud REST API) — optional companion MCP server
 
 ---
 
@@ -75,7 +75,7 @@ jira-mcp (optional) ──── MCP server ────────────
 - VS Code or Cursor
 - Node.js 18+
 - A Jira Cloud account with an API token
-- [`jira-mcp`](https://github.com/WenchuanLiliZhao/jira-mcp) *(optional — for Cursor AI Chat integration)*
+- `jira-mcp` *(optional — for Cursor AI Chat integration; install from your MCP server source)*
 
 ---
 
@@ -88,6 +88,6 @@ jira-mcp (optional) ──── MCP server ────────────
 
 ## Development Tracking
 
-Issues and exploration are tracked in the [JL Jira project](https://zhaowenchuan.atlassian.net/jira/software/projects/JL/boards).
+Issues and exploration are tracked in a private Jira project (URLs omitted in this public README).
 
-Current focus: [JL-1 — Define the Observation Layer](https://zhaowenchuan.atlassian.net/browse/JL-1)
+Current focus: define the Observation Layer (see project board in your Jira instance).
